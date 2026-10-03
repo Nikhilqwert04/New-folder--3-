@@ -65,57 +65,96 @@ namespace IntelVibrance.Core
 
             var ramp = new DisplayAPI.RAMP(true);
 
-            // Map 0..1 → a contrast/S-curve parameter
-            // At vibrance=0.5 → gamma=1.0 (neutral/linear)
-            // At vibrance=1.0 → higher contrast S-curve (vivid)
-            // At vibrance=0.0 → gamma-compressed (muted/faded)
+            // ─────────────────────────────────────────────────────────────────
+            // VIBRANCE via DIFFERENTIAL CHANNEL BOOSTING
+            // ─────────────────────────────────────────────────────────────────
+            //
+            // A true saturation matrix works by computing luminance:
+            //   L = 0.2126*R + 0.7152*G + 0.0722*B
+            // then lerping: out = L + sat * (input - L)
+            //
+            // For a gamma ramp (per-channel only), we can't do cross-channel
+            // math directly. Instead we apply a channel-specific S-curve strength
+            // based on that channel's luminance weight:
+            //   - Red   (luma weight 0.2126): boost more → richer reds/blues
+            //   - Green (luma weight 0.7152): boost least → green is the dominant luma channel
+            //   - Blue  (luma weight 0.0722): boost most → blue is the weakest, so we push it hard
+            //
+            // At vibrance=0.5 → all channels are linear (neutral).
+            // At vibrance=1.0 → R/B are boosted strongly, G moderately.
+            // At vibrance=0.0 → all channels pulled toward midpoint (desaturation).
+            //
+            // The differential S-curve between channels is what creates the
+            // perceived saturation shift — colors diverge from their gray value.
 
-            // We use a smooth S-curve approach:
-            // gamma controls the curve shape
-            // contrast controls the slope around midpoint
+            // Saturation factor: 0.0 = gray, 1.0 = normal, >1.0 = vivid
+            // Map slider 0..1 → saturation 0.0..2.5
+            double saturation = vibrance * 2.5; // 0.5 → 1.25 (slight boost at neutral)
+            // Remap so that 0.5 slider = exactly 1.0 saturation (neutral)
+            saturation = vibrance <= 0.5
+                ? vibrance * 2.0               // 0..1.0
+                : 1.0 + (vibrance - 0.5) * 3.0; // 1.0..2.5
 
-            double contrast;   // [-1, 1] where 0 = neutral
-            double gamma;      // power curve exponent
+            // Per-channel S-curve strengths based on inverse luminance weight
+            // (lower luma weight → we can push the channel harder without blowing out luminance)
+            // R luma=0.2126 → mid strength
+            // G luma=0.7152 → least boost (dominant channel)
+            // B luma=0.0722 → most boost
+            double[] lumaWeights = { 0.2126, 0.7152, 0.0722 };
+            // Derive per-channel "aggressiveness": channels that contribute less luma
+            // can be pushed more without changing perceived brightness
+            double maxWeight = 0.7152;
+            double[] channelBoost = new double[3];
+            for (int c = 0; c < 3; c++)
+                channelBoost[c] = 1.0 - (lumaWeights[c] / maxWeight); // R=0.70, G=0.0, B=0.90
 
-            if (vibrance >= 0.5)
+            ushort[][] channels = { ramp.Red, ramp.Green, ramp.Blue };
+
+            for (int c = 0; c < 3; c++)
             {
-                // Above neutral: increase vibrance
-                double t = (vibrance - 0.5) * 2.0; // 0..1
-                contrast = t * 0.45;                 // 0..0.45 contrast boost
-                gamma = 1.0 - t * 0.15;              // slight gamma pull (0.85..1.0)
+                // How much differential boost this channel gets
+                // At saturation=1.0 → neutral for all
+                // At saturation>1.0 → R/B get more S-curve than G
+                // At saturation<1.0 → all get pulled flat but R/B pulled harder
+                double boost = channelBoost[c];
+                double channelSat = saturation;
+
+                // Effective contrast for this channel's S-curve
+                double contrast;
+                double gamma;
+
+                if (saturation >= 1.0)
+                {
+                    double t = saturation - 1.0; // 0..1.5
+                    t = Math.Min(t, 1.5) / 1.5;   // normalize 0..1
+                    // G gets less contrast boost, R/B get more
+                    contrast = t * (0.20 + boost * 0.35); // G: 0..0.20, B: 0..0.515
+                    gamma = 1.0 - t * (0.05 + boost * 0.12); // mild gamma pull
+                }
+                else
+                {
+                    double t = 1.0 - saturation; // 0..1
+                    // All channels pull toward flat, R/B pull harder → desaturated
+                    contrast = -t * (0.20 + boost * 0.20);
+                    gamma = 1.0 + t * (0.10 + boost * 0.15);
+                }
+
+                for (int i = 0; i < 256; i++)
+                {
+                    double x = i / 255.0;
+
+                    // Gamma curve
+                    double y = Math.Pow(Math.Max(0, x), gamma);
+
+                    // S-curve contrast
+                    y = ApplySCurveContrast(y, contrast);
+
+                    y = Math.Max(0.0, Math.Min(1.0, y));
+                    channels[c][i] = (ushort)(y * 65535.0);
+                }
+
+                EnsureMonotonic(channels[c]);
             }
-            else
-            {
-                // Below neutral: decrease vibrance (mute)
-                double t = (0.5 - vibrance) * 2.0; // 0..1
-                contrast = -t * 0.35;               // negative contrast
-                gamma = 1.0 + t * 0.25;             // gamma push (1.0..1.25)
-            }
-
-            for (int i = 0; i < 256; i++)
-            {
-                double x = i / 255.0; // normalized 0..1
-
-                // Step 1: Apply power gamma curve
-                double y = Math.Pow(x, gamma);
-
-                // Step 2: Apply S-curve contrast
-                // S-curve: sigmoid-like around midpoint 0.5
-                y = ApplySCurveContrast(y, contrast);
-
-                // Step 3: Clamp and convert to 16-bit ramp value
-                y = Math.Max(0.0, Math.Min(1.0, y));
-                ushort val = (ushort)(y * 65535.0);
-
-                ramp.Red[i] = val;
-                ramp.Green[i] = val;
-                ramp.Blue[i] = val;
-            }
-
-            // Ensure monotonicity (Windows requirement)
-            EnsureMonotonic(ramp.Red);
-            EnsureMonotonic(ramp.Green);
-            EnsureMonotonic(ramp.Blue);
 
             return ramp;
         }
